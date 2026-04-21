@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  mdp-poc-stack: Producer -> SQS -> Consumer -> Raw S3 (Athena Ready) -> Glue -> Semantic S3
+
+Parameters:
+  Email:
+    Type: String
+    Description: "Email address for notifications"
+
+Resources:
+  # ==========================================
+  # 1. INGESTION LAYER
+  # ==========================================
+  MdpPocIngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: mdp-poc-ingest-queue
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+
+  MdpPocProducerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: mdp-poc-producer
+      Description: mdp-poc-producer - Generates 100 records and sends them to SQS
+      Handler: index.handler
+      Runtime: python3.13
+      MemorySize: 512
+      Timeout: 10
+      Tags:
+        cost_tag: mdp_poc
+      Environment:
+        Variables:
+          INGEST_QUEUE_URL: !Ref MdpPocIngestQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MdpPocIngestQueue.QueueName
+      Events:
+        Timer:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "rate(1 minute)"
+            Description: Triggers the producer lambda every minute
+      InlineCode: |
+        import json
+        import boto3
+        import os
+        import random
+        import uuid
+
+        sqs = boto3.client('sqs')
+        queue_url = os.environ['INGEST_QUEUE_URL']
+        countries = ['USA', 'UK', 'Germany', 'Hungary', 'France']
+
+        def handler(event, context):
+            entries = []
+            
+            for _ in range(100):
+                payload = {
+                    "country": random.choice(countries),
+                    "wage": random.randint(30000, 120000)
+                }
+                entries.append({
+                    'Id': str(uuid.uuid4()),
+                    'MessageBody': json.dumps(payload)
+                })
+
+            success_count = 0
+            for i in range(0, len(entries), 10):
+                batch = entries[i:i+10]
+                
+                response = sqs.send_message_batch(
+                    QueueUrl=queue_url,
+                    Entries=batch
+                )
+                success_count += len(response.get('Successful', []))
+
+            print(f"Sent 10 batches. Total Successful: {success_count}")
+            
+            return {
+                "statusCode": 200,
+                "body": f"Batch process complete. {success_count}/100 delivered."
+            }
+
+  # ==========================================
+  # 2. STORAGE LAYER (S3 Buckets)
+  # ==========================================
+  MdpPocCodeRepoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub mdp-poc-code-repo-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+
+  MdpPocRawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub mdp-poc-raw-data-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+
+  MdpPocSemanticBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub mdp-poc-semantic-data-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+
+  # ==========================================
+  # 3. CONSUMER LAMBDA (Updated for Athena)
+  # ==========================================
+  MdpPocConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: mdp-poc-consumer
+      Description: Reads SQS, writes to Raw S3 in Athena-compatible JSON Lines format
+      Handler: index.handler
+      Runtime: python3.13
+      MemorySize: 512
+      Timeout: 30
+      Tags:
+        cost_tag: mdp_poc
+      Environment:
+        Variables:
+          RAW_BUCKET_NAME: !Ref MdpPocRawDataBucket
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MdpPocIngestQueue.Arn
+            BatchSize: 10
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref MdpPocRawDataBucket
+      InlineCode: |
+        import json
+        import boto3
+        import os
+        import uuid
+        from datetime import datetime
+
+        s3 = boto3.client('s3')
+        bucket_name = os.environ['RAW_BUCKET_NAME']
+
+        def handler(event, context):
+            records = []
+            today = datetime.utcnow().strftime('%Y-%m-%d')
+
+            for record in event['Records']:
+                # Athena JSON Lines expects newline delimited objects, not a single array
+                body = record['body'] 
+                records.append(body)
+
+            if records:
+                # Join with newline character
+                file_content = "\n".join(records)
+                file_key = f"data/p_ingest_day={today}/{uuid.uuid4()}.json"
+
+                s3.put_object(
+                    Bucket=bucket_name,
+                    Key=file_key,
+                    Body=file_content
+                )
+                print(f"Wrote {len(records)} records to s3://{bucket_name}/{file_key}")
+
+            return {"statusCode": 200, "body": f"Processed {len(records)} records"}
+
+  # ==========================================
+  # 4. GLUE LAYER & ATHENA TABLE
+  # ==========================================
+  MdpPocGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: mdp_poc_database      
+        Description: mdp_poc_database - Stores Iceberg and Raw tables
+
+  # The New Athena/Glue Table configured with Partition Projection
+  MdpPocRawDataTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref MdpPocGlueDatabase
+      TableInput:
+        Name: raw_ingest_data
+        Description: Athena queryable external table over the raw JSON data
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          "classification": "json"
+          "projection.enabled": "true"
+          "projection.p_ingest_day.type": "date"
+          "projection.p_ingest_day.format": "yyyy-MM-dd"
+          "projection.p_ingest_day.range": "2024-01-01,NOW"
+          "projection.p_ingest_day.interval": "1"
+          "projection.p_ingest_day.interval.unit": "DAYS"
+          "storage.location.template": !Sub "s3://${MdpPocRawDataBucket}/data/p_ingest_day=$${p_ingest_day}/"
+        PartitionKeys:
+          - Name: p_ingest_day
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${MdpPocRawDataBucket}/data/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - Name: country
+              Type: string
+            - Name: wage
+              Type: int
+
+  MdpPocGlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: mdp-poc-glue-job-role
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: mdp-poc-s3-access-for-glue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub ${MdpPocRawDataBucket.Arn}
+                  - !Sub ${MdpPocRawDataBucket.Arn}/*
+                  - !Sub ${MdpPocSemanticBucket.Arn}
+                  - !Sub ${MdpPocSemanticBucket.Arn}/*
+                  - !Sub ${MdpPocCodeRepoBucket.Arn}
+                  - !Sub ${MdpPocCodeRepoBucket.Arn}/*
+
+  MdpPocTransformGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mdp-poc-transform-job
+      Role: !Ref MdpPocGlueJobRole
+      GlueVersion: '4.0'
+      WorkerType: G.1X              
+      NumberOfWorkers: 2            
+      Tags:
+        cost_tag: mdp_poc
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${MdpPocCodeRepoBucket}/glue_scripts/transform.py
+        PythonVersion: '3'
+      DefaultArguments:
+        '--datalake-formats': iceberg
+        '--raw_bucket': !Ref MdpPocRawDataBucket
+        '--semantic_bucket': !Ref MdpPocSemanticBucket
+        '--database_name': !Ref MdpPocGlueDatabase
+        '--enable-job-insights': 'false' 
+
+  # ==========================================
+  # 5. NOTIFICATION & MONITORING LAYER
+  # ==========================================
+  MdpPocJobNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: mdp-poc-job-notifications
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+
+  MdpPocSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref MdpPocJobNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref MdpPocJobNotificationTopic
+
+  MdpPocEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref MdpPocJobNotificationTopic
+      Protocol: email
+      Endpoint: !Ref Email
+
+  MdpPocGlueJobTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: mdp-poc-glue-job-trigger-every-10-minutes
+      Type: SCHEDULED
+      Schedule: "cron(0/10 * ? * * *)" 
+      StartOnCreation: true
+      Tags:
+        cost_tag: mdp_poc
+      Actions:
+        - JobName: !Ref MdpPocTransformGlueJob
+
+  MdpPocGlueJobEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: mdp-poc-glue-job-monitor
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - Glue Job State Change
+        detail:
+          jobName:
+            - !Ref MdpPocTransformGlueJob
+          state:
+            - SUCCEEDED
+            - FAILED
+            - TIMEOUT
+            - ERROR
+      Targets:
+        - Arn: !Ref MdpPocJobNotificationTopic
+          Id: mdp-poc-sns-target
+          InputTransformer:
+            InputPathsMap:
+              jobState: "$.detail.state"
+            InputTemplate: '"Your GlueJob <jobState>!"'
