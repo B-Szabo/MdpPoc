@@ -208,7 +208,7 @@ Resources:
           "projection.p_ingest_day.range": "2024-01-01,NOW"
           "projection.p_ingest_day.interval": "1"
           "projection.p_ingest_day.interval.unit": "DAYS"
-          "storage.location.template": !Sub "s3://${MdpPocRawDataBucket}/data/p_ingest_day=$${p_ingest_day}/"
+          "storage.location.template": !Sub "s3://${MdpPocRawDataBucket}/data/p_ingest_day=${!p_ingest_day}/"
         PartitionKeys:
           - Name: p_ingest_day
             Type: string
