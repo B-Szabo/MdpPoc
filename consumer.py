@@ -7,7 +7,7 @@ from datetime import datetime
 s3 = boto3.client('s3')
 bucket_name = os.environ['RAW_BUCKET_NAME']
 
-def handler(event, context):
+def lambda_handler(event, context):
     records = []
     today = datetime.utcnow().strftime('%Y-%m-%d')
 
