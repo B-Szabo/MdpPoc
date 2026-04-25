@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: mdp-poc-ingestion Isolated Producer Lambda, Trigger, and SQS Queue.
+
+Resources:
+  # ==========================================
+  # 1. INGESTION QUEUE
+  # ==========================================
+  MdpPocIngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: mdp-poc-ingest-queue
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+
+  # ==========================================
+  # 2. PRODUCER LAMBDA
+  # ==========================================
+  MdpPocProducerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: mdp-poc-producer
+      Description: mdp-poc-producer - Generates 100 records and sends them to SQS
+      Handler: index.handler
+      Runtime: python3.13
+      MemorySize: 512
+      Timeout: 10
+      Tags:
+        cost_tag: mdp_poc
+      Environment:
+        Variables:
+          INGEST_QUEUE_URL: !Ref MdpPocIngestQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MdpPocIngestQueue.QueueName
+      Events:
+        # Original ScheduleV2 Trigger
+        Timer:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "rate(1 minute)"
+            Description: Triggers the producer lambda every minute
+      InlineCode: |
+        import json
+        import boto3
+        import os
+        import random
+        import uuid
+
+        sqs = boto3.client('sqs')
+        queue_url = os.environ['INGEST_QUEUE_URL']
+        countries = ['USA', 'UK', 'Germany', 'Hungary', 'France']
+
+        def handler(event, context):
+            entries = []
+            
+            for _ in range(100):
+                payload = {
+                    "country": random.choice(countries),
+                    "wage": random.randint(30000, 120000)
+                }
+                entries.append({
+                    'Id': str(uuid.uuid4()),
+                    'MessageBody': json.dumps(payload)
+                })
+
+            success_count = 0
+            for i in range(0, len(entries), 10):
+                batch = entries[i:i+10]
+                
+                response = sqs.send_message_batch(
+                    QueueUrl=queue_url,
+                    Entries=batch
+                )
+                success_count += len(response.get('Successful', []))
+
+            print(f"Sent 10 batches. Total Successful: {success_count}")
+            
+            return {
+                "statusCode": 200,
+                "body": f"Batch process complete. {success_count}/100 delivered."
+            }
+
+Outputs:
+  QueueURL:
+    Description: "URL of the Ingest SQS Queue"
+    Value: !Ref MdpPocIngestQueue
+  ProducerLambdaArn:
+    Description: "ARN of the Producer Lambda Function"
+    Value: !GetAtt MdpPocProducerFunction.Arn
