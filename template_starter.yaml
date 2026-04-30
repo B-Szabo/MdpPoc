@@ -53,7 +53,7 @@ Resources:
         import uuid
         import time
         from datetime import datetime, timezone, timedelta
-
+        
         sqs = boto3.client('sqs')
         queue_url = os.environ['INGEST_QUEUE_URL']
         
@@ -63,10 +63,10 @@ Resources:
         TIME_MULTIPLIER = int(os.environ['TIME_MULTIPLIER'])
         
         CHARGERS = [f"charger-{str(i).zfill(3)}" for i in range(1, 11)]
-
+        
         def generate_event_id():
             return uuid.uuid4().hex[:12].upper()
-
+        
         def get_timestamp_with_offset(record_index):
             current_real_epoch = time.time()
             elapsed_real_seconds = current_real_epoch - WORKSHOP_START_EPOCH
@@ -87,41 +87,31 @@ Resources:
             final_dt = base_dt + timedelta(minutes=minutes_to_add)
             
             return final_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
+        
         def generate_base_event(charger_id, event_type, record_index):
-            # The Unified "Flat and Wide" Schema Initializer
+            # Updated to strict 5-column schema
             return {
                 "event_id": generate_event_id(),
                 "event_time": get_timestamp_with_offset(record_index),
                 "charger_id": charger_id,
                 "event_type": event_type,
-                "connector_id": None,
-                "status": None,
-                "temperature_c": None,
-                "voltage_v": None,
-                "current_a": None,
-                "session_id": None,
-                "vehicle_id": None,
-                "state": None,
-                "power_kw": None,
-                "energy_kwh_total": None,
-                "fault_code": None,
-                "severity": None,
-                "message": None
+                "payload": {}
             }
-
+        
         def generate_telemetry(charger_id, record_index):
             event = generate_base_event(charger_id, "telemetry", record_index)
             status = random.choices(["available", "charging", "faulted"], weights=[70, 25, 5])[0]
             
-            event["connector_id"] = random.choice([1, 2])
-            event["status"] = status
-            event["temperature_c"] = round(random.uniform(25.0, 45.0) + (15.0 if status == "charging" else 0.0), 1)
-            event["voltage_v"] = round(random.uniform(395.0, 405.0), 1)
-            event["current_a"] = round(random.uniform(16.0, 200.0), 1) if status == "charging" else 0.0
+            event["payload"] = {
+                "connector_id": random.choice([1, 2]),
+                "status": status,
+                "temperature_c": round(random.uniform(25.0, 45.0) + (15.0 if status == "charging" else 0.0), 1),
+                "voltage_v": round(random.uniform(395.0, 405.0), 1),
+                "current_a": round(random.uniform(16.0, 200.0), 1) if status == "charging" else 0.0
+            }
             
             return event
-
+        
         def generate_session(charger_id, record_index):
             event = generate_base_event(charger_id, "session", record_index)
             # Use the synthetic time to generate the session ID prefix
@@ -130,15 +120,17 @@ Resources:
             
             state = random.choices(["starting", "charging", "completed"], weights=[10, 70, 20])[0]
             
-            event["connector_id"] = random.choice([1, 2])
-            event["session_id"] = f"sess-{date_str}-{random.randint(1000,9999)}"
-            event["vehicle_id"] = f"veh-{random.randint(1000, 1999)}"
-            event["state"] = state
-            event["power_kw"] = round(random.uniform(11.0, 150.0), 1) if state != "completed" else 0.0
-            event["energy_kwh_total"] = round(random.uniform(5.0, 75.0), 1) if state != "starting" else round(random.uniform(0.1, 2.0), 1)
+            event["payload"] = {
+                "connector_id": random.choice([1, 2]),
+                "session_id": f"sess-{date_str}-{random.randint(1000,9999)}",
+                "vehicle_id": f"veh-{random.randint(1000, 1999)}",
+                "state": state,
+                "power_kw": round(random.uniform(11.0, 150.0), 1) if state != "completed" else 0.0,
+                "energy_kwh_total": round(random.uniform(5.0, 75.0), 1) if state != "starting" else round(random.uniform(0.1, 2.0), 1)
+            }
             
             return event
-
+        
         def generate_fault(charger_id, record_index):
             event = generate_base_event(charger_id, "fault", record_index)
             faults = [
@@ -148,13 +140,15 @@ Resources:
             ]
             f_code, f_sev, f_msg, conn_id = random.choice(faults)
             
-            event["connector_id"] = conn_id
-            event["fault_code"] = f_code
-            event["severity"] = f_sev
-            event["message"] = f_msg
+            event["payload"] = {
+                "connector_id": conn_id,
+                "fault_code": f_code,
+                "severity": f_sev,
+                "message": f_msg
+            }
             
             return event
-
+        
         def handler(event, context):
             entries = []
             
@@ -169,12 +163,12 @@ Resources:
                     payload = generate_session(charger_id, i)
                 else:
                     payload = generate_fault(charger_id, i)
-
+        
                 entries.append({
                     'Id': str(uuid.uuid4()),
                     'MessageBody': json.dumps(payload)
                 })
-
+        
             # Send all 10 records in a single SQS batch
             response = sqs.send_message_batch(
                 QueueUrl=queue_url,
