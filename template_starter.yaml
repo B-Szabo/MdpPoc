@@ -33,8 +33,8 @@ Resources:
           INGEST_QUEUE_URL: !Ref MdpPocIngestQueue
           # Configuration for Time Compression
           # IMPORTANT: Update WORKSHOP_START_EPOCH to the current Unix timestamp right before your workshop starts!
-          WORKSHOP_START_EPOCH: "1714420000" 
-          SYNTHETIC_START_EPOCH: "1767225600" # Epoch for January 1, 2026, 00:00:00 UTC
+          WORKSHOP_START_EPOCH: "1778090400" 
+          SYNTHETIC_START_EPOCH: "1735689600" # Epoch for January 1, 2025, 00:00:00 UTC
           TIME_MULTIPLIER: "168"              # 1 real minute = 168 synthetic minutes
       Policies:
         - SQSSendMessagePolicy:
