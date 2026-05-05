@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS glue_catalog.{database_name}.telemetry_history (
 )
 USING iceberg
 PARTITIONED BY (p_ingest_day, charger_id)
-LOCATION 's3://{semantic_bucket}/iceberg_tables/telemetry_history/'
 TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read')
 """)
 spark.sql(f"INSERT OVERWRITE glue_catalog.{database_name}.telemetry_history SELECT * FROM vw_telemetry")
@@ -112,7 +111,6 @@ CREATE TABLE IF NOT EXISTS glue_catalog.{database_name}.session_metrics (
 )
 USING iceberg
 PARTITIONED BY (p_ingest_day)
-LOCATION 's3://{semantic_bucket}/iceberg_tables/session_metrics/'
 TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read')
 """)
 spark.sql(f"INSERT OVERWRITE glue_catalog.{database_name}.session_metrics SELECT * FROM vw_session")
@@ -139,7 +137,6 @@ CREATE TABLE IF NOT EXISTS glue_catalog.{database_name}.fault_logs (
 )
 USING iceberg
 PARTITIONED BY (p_ingest_day)
-LOCATION 's3://{semantic_bucket}/iceberg_tables/fault_logs/'
 TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read')
 """)
 spark.sql(f"INSERT OVERWRITE glue_catalog.{database_name}.fault_logs SELECT * FROM vw_faults")
