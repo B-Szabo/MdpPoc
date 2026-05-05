@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: mdp-poc-ingestion Isolated Producer Lambda, Trigger, and SQS Queue.
+Description: mdp-poc-ingestion Producer with DynamoDB State Machine (Variable Charge Targets, 10% Fault, Noisy Telemetry).
 
 Resources:
   # ==========================================
@@ -15,30 +15,49 @@ Resources:
           Value: mdp_poc
 
   # ==========================================
-  # 2. PRODUCER LAMBDA
+  # 2. DYNAMODB STATE TABLE
+  # ==========================================
+  MdpPocChargerStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: mdp-poc-charger-state
+      AttributeDefinitions:
+        - AttributeName: charger_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: charger_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: cost_tag
+          Value: mdp_poc
+
+  # ==========================================
+  # 3. PRODUCER LAMBDA
   # ==========================================
   MdpPocProducerFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: mdp-poc-producer
-      Description: Generates 10 EV records/min with a unified schema and time compression.
+      Description: Generates stateful EV records with variable session targets.
       Handler: index.handler
       Runtime: python3.13
       MemorySize: 512
-      Timeout: 10
+      Timeout: 15
       Tags:
         cost_tag: mdp_poc
       Environment:
         Variables:
           INGEST_QUEUE_URL: !Ref MdpPocIngestQueue
-          # Configuration for Time Compression
-          # IMPORTANT: Update WORKSHOP_START_EPOCH to the current Unix timestamp right before your workshop starts!
+          STATE_TABLE_NAME: !Ref MdpPocChargerStateTable
           WORKSHOP_START_EPOCH: "1778090400" 
-          SYNTHETIC_START_EPOCH: "1735689600" # Epoch for January 1, 2025, 00:00:00 UTC
-          TIME_MULTIPLIER: "168"              # 1 real minute = 168 synthetic minutes
+          SYNTHETIC_START_EPOCH: "1735689600"
+          TIME_MULTIPLIER: "10" 
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt MdpPocIngestQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MdpPocChargerStateTable
       Events:
         Timer:
           Type: ScheduleV2
@@ -52,135 +71,218 @@ Resources:
         import random
         import uuid
         import time
+        from decimal import Decimal
         from datetime import datetime, timezone, timedelta
         
         sqs = boto3.client('sqs')
-        queue_url = os.environ['INGEST_QUEUE_URL']
+        dynamodb = boto3.resource('dynamodb')
         
-        # Load Time Configuration from Environment
+        queue_url = os.environ['INGEST_QUEUE_URL']
+        table_name = os.environ['STATE_TABLE_NAME']
+        table = dynamodb.Table(table_name)
+        
         WORKSHOP_START_EPOCH = int(os.environ['WORKSHOP_START_EPOCH'])
         SYNTHETIC_START_EPOCH = int(os.environ['SYNTHETIC_START_EPOCH'])
         TIME_MULTIPLIER = int(os.environ['TIME_MULTIPLIER'])
         
         CHARGERS = [f"charger-{str(i).zfill(3)}" for i in range(1, 11)]
-        
+        POWER_KW = Decimal('50.0') # 50kW DC Fast Charger
+
+        class DecimalEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, Decimal):
+                    return float(obj)
+                return super(DecimalEncoder, self).default(obj)
+
         def generate_event_id():
             return uuid.uuid4().hex[:12].upper()
-        
-        def get_timestamp_with_offset(record_index):
+
+        def get_current_synthetic_epoch():
             current_real_epoch = time.time()
-            elapsed_real_seconds = current_real_epoch - WORKSHOP_START_EPOCH
-            
-            if elapsed_real_seconds < 0:
-                elapsed_real_seconds = 0
-                
-            # Scale the elapsed time
+            elapsed_real_seconds = max(0, current_real_epoch - WORKSHOP_START_EPOCH)
             elapsed_synthetic_seconds = elapsed_real_seconds * TIME_MULTIPLIER
-            current_synthetic_epoch = SYNTHETIC_START_EPOCH + elapsed_synthetic_seconds
-            
-            # Convert to datetime object
-            base_dt = datetime.fromtimestamp(current_synthetic_epoch, timezone.utc)
-            
-            # Add micro-offset so all 10 records in the batch don't have the exact same synthetic second
-            # Spread them evenly across the simulated time window (e.g., across 168 minutes)
-            minutes_to_add = record_index * (TIME_MULTIPLIER / 10)
-            final_dt = base_dt + timedelta(minutes=minutes_to_add)
-            
-            return final_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        def generate_base_event(charger_id, event_type, record_index):
-            # Updated to strict 5-column schema
-            return {
-                "event_id": generate_event_id(),
-                "event_time": get_timestamp_with_offset(record_index),
-                "charger_id": charger_id,
-                "event_type": event_type,
-                "payload": {}
-            }
-        
-        def generate_telemetry(charger_id, record_index):
-            event = generate_base_event(charger_id, "telemetry", record_index)
-            status = random.choices(["available", "charging", "faulted"], weights=[70, 25, 5])[0]
-            
-            event["payload"] = {
-                "connector_id": random.choice([1, 2]),
-                "status": status,
-                "temperature_c": round(random.uniform(25.0, 45.0) + (15.0 if status == "charging" else 0.0), 1),
-                "voltage_v": round(random.uniform(395.0, 405.0), 1),
-                "current_a": round(random.uniform(16.0, 200.0), 1) if status == "charging" else 0.0
-            }
-            
-            return event
-        
-        def generate_session(charger_id, record_index):
-            event = generate_base_event(charger_id, "session", record_index)
-            # Use the synthetic time to generate the session ID prefix
-            synthetic_time_str = event["event_time"]
-            date_str = datetime.strptime(synthetic_time_str, "%Y-%m-%dT%H:%M:%SZ").strftime('%Y%m%d')
-            
-            state = random.choices(["starting", "charging", "completed"], weights=[10, 70, 20])[0]
-            
-            event["payload"] = {
-                "connector_id": random.choice([1, 2]),
-                "session_id": f"sess-{date_str}-{random.randint(1000,9999)}",
-                "vehicle_id": f"veh-{random.randint(1000, 1999)}",
-                "state": state,
-                "power_kw": round(random.uniform(11.0, 150.0), 1) if state != "completed" else 0.0,
-                "energy_kwh_total": round(random.uniform(5.0, 75.0), 1) if state != "starting" else round(random.uniform(0.1, 2.0), 1)
-            }
-            
-            return event
-        
-        def generate_fault(charger_id, record_index):
-            event = generate_base_event(charger_id, "fault", record_index)
-            faults = [
-                ("E_OVERCURRENT", "critical", "Overcurrent detected, charging stopped", random.choice([1, 2])),
-                ("E_TEMP_HIGH", "warning", "Thermal limit approached, throttling power", random.choice([1, 2])),
-                ("E_COMMS_LOSS", "warning", "Backend connection lost", None)
-            ]
-            f_code, f_sev, f_msg, conn_id = random.choice(faults)
-            
-            event["payload"] = {
-                "connector_id": conn_id,
-                "fault_code": f_code,
-                "severity": f_sev,
-                "message": f_msg
-            }
-            
-            return event
-        
-        def handler(event, context):
-            entries = []
-            
-            # Generate exactly 10 records per minute
-            for i in range(10):
-                charger_id = random.choice(CHARGERS)
-                event_type = random.choices(['telemetry', 'session', 'fault'], weights=[70, 20, 10])[0]
-                
-                if event_type == 'telemetry':
-                    payload = generate_telemetry(charger_id, i)
-                elif event_type == 'session':
-                    payload = generate_session(charger_id, i)
-                else:
-                    payload = generate_fault(charger_id, i)
-        
-                entries.append({
-                    'Id': str(uuid.uuid4()),
-                    'MessageBody': json.dumps(payload)
-                })
-        
-            # Send all 10 records in a single SQS batch
-            response = sqs.send_message_batch(
-                QueueUrl=queue_url,
-                Entries=entries
+            return SYNTHETIC_START_EPOCH + elapsed_synthetic_seconds
+
+        def get_event_timestamp(synthetic_epoch, index_offset):
+            offset_seconds = index_offset * (TIME_MULTIPLIER / 10)
+            dt = datetime.fromtimestamp(synthetic_epoch + offset_seconds, timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def fetch_states():
+            response = dynamodb.meta.client.batch_get_item(
+                RequestItems={
+                    table_name: {
+                        'Keys': [{'charger_id': cid} for cid in CHARGERS]
+                    }
+                }
             )
+            states = {item['charger_id']: item for item in response.get('Responses', {}).get(table_name, [])}
+            return states
+
+        def process_charger_state(charger_id, state, current_synth_epoch, index):
+            event_time = get_event_timestamp(current_synth_epoch, index)
+            payloads = []
             
-            success_count = len(response.get('Successful', []))
-            print(f"Sent batch. Total Successful: {success_count}/10")
+            if not state:
+                state = {
+                    'charger_id': charger_id,
+                    'status': 'AVAILABLE',
+                    'session_id': None,
+                    'vehicle_id': None,
+                    'energy_kwh_total': Decimal('0.0'),
+                    'target_energy_kwh': Decimal('0.0'), # NEW: Session-specific target
+                    'last_update_epoch': Decimal(str(current_synth_epoch)),
+                    'fault_clear_epoch': None
+                }
+
+            last_update = float(state['last_update_epoch'])
+            delta_synthetic_seconds = current_synth_epoch - last_update
+            delta_synthetic_minutes = delta_synthetic_seconds / 60.0
+            
+            status = state['status']
+            
+            # ---------------------------------------------------------
+            # STATE: AVAILABLE
+            # ---------------------------------------------------------
+            if status == 'AVAILABLE':
+                if random.random() < 0.10: # 10% chance to start session
+                    state['status'] = 'CHARGING'
+                    state['session_id'] = f"sess-{datetime.fromtimestamp(current_synth_epoch, timezone.utc).strftime('%Y%m%d')}-{random.randint(1000,9999)}"
+                    state['vehicle_id'] = f"veh-{random.randint(100, 999)}"
+                    state['energy_kwh_total'] = Decimal('0.0')
+                    
+                    # ---> UPDATED: Generate a random target for this specific session (between 5 and 50 kWh)
+                    random_target = round(random.uniform(5.0, 50.0), 1)
+                    state['target_energy_kwh'] = Decimal(str(random_target))
+                    
+                    payloads.append({
+                        "event_type": "session",
+                        "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "starting", "power_kw": 0.0, "energy_kwh_total": 0.0}
+                    })
+                else:
+                    payloads.append({
+                        "event_type": "telemetry",
+                        "payload": {
+                            "connector_id": 1, "status": "available", 
+                            "temperature_c": round(random.uniform(20.0, 23.0), 1), 
+                            "voltage_v": round(random.uniform(398.0, 402.0), 1), 
+                            "current_a": 0.0
+                        }
+                    })
+
+            # ---------------------------------------------------------
+            # STATE: CHARGING
+            # ---------------------------------------------------------
+            elif status == 'CHARGING':
+                energy_added = (POWER_KW / Decimal('60.0')) * Decimal(str(delta_synthetic_minutes))
+                state['energy_kwh_total'] += energy_added
+                
+                # ---> UPDATED: Check against the session-specific target, not a global one
+                if state['energy_kwh_total'] >= state['target_energy_kwh']:
+                    payloads.append({
+                        "event_type": "session",
+                        "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "completed", "power_kw": 0.0, "energy_kwh_total": float(state['energy_kwh_total'])}
+                    })
+                    state['status'] = 'AVAILABLE'
+                    state['session_id'] = None
+                    state['vehicle_id'] = None
+                    state['energy_kwh_total'] = Decimal('0.0')
+                    state['target_energy_kwh'] = Decimal('0.0')
+                
+                elif random.random() < 0.10: 
+                    payloads.append({
+                        "event_type": "fault",
+                        "payload": {"connector_id": 1, "fault_code": "E_TEMP_HIGH", "severity": "warning", "message": "Thermal limit approached"}
+                    })
+                    state['status'] = 'FAULTED'
+                    state['fault_clear_epoch'] = Decimal(str(current_synth_epoch + (30 * 60)))
+                    
+                else:
+                    payloads.append({
+                        "event_type": "telemetry",
+                        "payload": {
+                            "connector_id": 1, "status": "charging", 
+                            "temperature_c": round(random.uniform(38.0, 44.0), 1), 
+                            "voltage_v": round(random.uniform(395.0, 405.0), 1), 
+                            "current_a": round(random.uniform(122.0, 126.0), 1)
+                        }
+                    })
+                    payloads.append({
+                        "event_type": "session",
+                        "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "charging", "power_kw": float(POWER_KW), "energy_kwh_total": float(state['energy_kwh_total'])}
+                    })
+
+            # ---------------------------------------------------------
+            # STATE: FAULTED
+            # ---------------------------------------------------------
+            elif status == 'FAULTED':
+                if current_synth_epoch >= float(state['fault_clear_epoch']):
+                    state['status'] = 'AVAILABLE'
+                    state['fault_clear_epoch'] = None
+                    if state['session_id']:
+                        payloads.append({
+                            "event_type": "session",
+                            "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "completed", "power_kw": 0.0, "energy_kwh_total": float(state['energy_kwh_total'])}
+                        })
+                        state['session_id'] = None
+                        state['vehicle_id'] = None
+                        state['energy_kwh_total'] = Decimal('0.0')
+                        state['target_energy_kwh'] = Decimal('0.0')
+                else:
+                    payloads.append({
+                        "event_type": "telemetry",
+                        "payload": {
+                            "connector_id": 1, "status": "faulted", 
+                            "temperature_c": round(random.uniform(44.0, 46.0), 1), 
+                            "voltage_v": round(random.uniform(398.0, 402.0), 1), 
+                            "current_a": 0.0
+                        }
+                    })
+
+            state['last_update_epoch'] = Decimal(str(current_synth_epoch))
+            
+            events = []
+            for p in payloads:
+                events.append({
+                    "event_id": generate_event_id(),
+                    "event_time": event_time,
+                    "charger_id": charger_id,
+                    "event_type": p["event_type"],
+                    "payload": p["payload"]
+                })
+                
+            return state, events
+
+        def handler(event, context):
+            current_synth_epoch = get_current_synthetic_epoch()
+            states = fetch_states()
+            
+            updated_states = []
+            all_events = []
+            
+            for i, charger_id in enumerate(CHARGERS):
+                current_state = states.get(charger_id)
+                new_state, events = process_charger_state(charger_id, current_state, current_synth_epoch, i)
+                updated_states.append(new_state)
+                all_events.extend(events)
+
+            with table.batch_writer() as batch:
+                for state in updated_states:
+                    batch.put_item(Item=state)
+
+            entries = [{'Id': str(uuid.uuid4()), 'MessageBody': json.dumps(evt, cls=DecimalEncoder)} for evt in all_events]
+            
+            successful = 0
+            for i in range(0, len(entries), 10):
+                batch_entries = entries[i:i+10]
+                response = sqs.send_message_batch(QueueUrl=queue_url, Entries=batch_entries)
+                successful += len(response.get('Successful', []))
+                
+            print(f"Sent batch. Total Successful: {successful}/{len(entries)}")
             
             return {
                 "statusCode": 200,
-                "body": f"Batch process complete. {success_count}/10 delivered."
+                "body": f"Processed 10 chargers. Generated {len(entries)} events."
             }
 
 Outputs:
