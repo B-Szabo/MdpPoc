@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: mdp-poc-ingestion Producer with Time-of-Day Traffic, Mixed Power Specs, and Single Fault Triggers.
+Description: mdp-poc-ingestion Producer with High Traffic (40% Day / 20% Night).
 
 Resources:
   # ==========================================
@@ -39,7 +39,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: mdp-poc-producer
-      Description: Generates highly varied EV records with a single fault trigger.
+      Description: Generates highly varied EV records with a high traffic curve.
       Handler: index.handler
       Runtime: python3.13
       MemorySize: 512
@@ -143,10 +143,12 @@ Resources:
             target_amps = float(current_power_kw * 1000) / base_volts
             
             simulated_hour = datetime.fromtimestamp(current_synth_epoch, timezone.utc).hour
+            
+            # ---> UPDATED: 40% Day Traffic, 20% Night Traffic <---
             if 7 <= simulated_hour <= 19:
-                traffic_chance = 0.15  
+                traffic_chance = 0.40  
             else:
-                traffic_chance = 0.02  
+                traffic_chance = 0.20  
             
             if not state:
                 state = {
@@ -207,7 +209,6 @@ Resources:
                 if random.random() < 0.10: 
                     chosen_fault = random.choice(POSSIBLE_FAULTS)
                     
-                    # This is the initial trigger. It stays here so we log the exact moment of failure.
                     payloads.append({
                         "event_type": "fault",
                         "payload": {"connector_id": active_conn, "fault_code": chosen_fault["code"], "severity": chosen_fault["sev"], "message": chosen_fault["msg"]}
@@ -269,7 +270,6 @@ Resources:
                 else:
                     active_fault = state.get('active_fault') or POSSIBLE_FAULTS[0]
                     
-                    # Output ONLY telemetry while waiting for the fault to clear
                     payloads.append({
                         "event_type": "telemetry",
                         "payload": {
