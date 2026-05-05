@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: mdp-poc-ingestion Producer with DynamoDB State Machine (Variable Charge Targets, 10% Fault, Noisy Telemetry).
+Description: mdp-poc-ingestion Producer with DynamoDB State Machine (Continuous Fault Logging).
 
 Resources:
   # ==========================================
@@ -39,7 +39,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: mdp-poc-producer
-      Description: Generates stateful EV records with variable session targets.
+      Description: Generates stateful EV records and broadcasts continuous faults.
       Handler: index.handler
       Runtime: python3.13
       MemorySize: 512
@@ -130,7 +130,7 @@ Resources:
                     'session_id': None,
                     'vehicle_id': None,
                     'energy_kwh_total': Decimal('0.0'),
-                    'target_energy_kwh': Decimal('0.0'), # NEW: Session-specific target
+                    'target_energy_kwh': Decimal('0.0'),
                     'last_update_epoch': Decimal(str(current_synth_epoch)),
                     'fault_clear_epoch': None
                 }
@@ -151,7 +151,6 @@ Resources:
                     state['vehicle_id'] = f"veh-{random.randint(100, 999)}"
                     state['energy_kwh_total'] = Decimal('0.0')
                     
-                    # ---> UPDATED: Generate a random target for this specific session (between 5 and 50 kWh)
                     random_target = round(random.uniform(5.0, 50.0), 1)
                     state['target_energy_kwh'] = Decimal(str(random_target))
                     
@@ -177,7 +176,6 @@ Resources:
                 energy_added = (POWER_KW / Decimal('60.0')) * Decimal(str(delta_synthetic_minutes))
                 state['energy_kwh_total'] += energy_added
                 
-                # ---> UPDATED: Check against the session-specific target, not a global one
                 if state['energy_kwh_total'] >= state['target_energy_kwh']:
                     payloads.append({
                         "event_type": "session",
@@ -229,6 +227,7 @@ Resources:
                         state['energy_kwh_total'] = Decimal('0.0')
                         state['target_energy_kwh'] = Decimal('0.0')
                 else:
+                    # ---> STILL FAULTED: Output BOTH telemetry and fault events every minute <---
                     payloads.append({
                         "event_type": "telemetry",
                         "payload": {
@@ -236,6 +235,15 @@ Resources:
                             "temperature_c": round(random.uniform(44.0, 46.0), 1), 
                             "voltage_v": round(random.uniform(398.0, 402.0), 1), 
                             "current_a": 0.0
+                        }
+                    })
+                    payloads.append({
+                        "event_type": "fault",
+                        "payload": {
+                            "connector_id": 1, 
+                            "fault_code": "E_TEMP_HIGH", 
+                            "severity": "warning", 
+                            "message": "Thermal limit approached (Active Alarm)"
                         }
                     })
 
