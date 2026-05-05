@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: mdp-poc-ingestion Producer with DynamoDB State Machine (Continuous Fault Logging).
+Description: mdp-poc-ingestion Producer with Time-of-Day Traffic, Mixed Power Specs, and Single Fault Triggers.
 
 Resources:
   # ==========================================
@@ -39,7 +39,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: mdp-poc-producer
-      Description: Generates stateful EV records and broadcasts continuous faults.
+      Description: Generates highly varied EV records with a single fault trigger.
       Handler: index.handler
       Runtime: python3.13
       MemorySize: 512
@@ -86,7 +86,21 @@ Resources:
         TIME_MULTIPLIER = int(os.environ['TIME_MULTIPLIER'])
         
         CHARGERS = [f"charger-{str(i).zfill(3)}" for i in range(1, 11)]
-        POWER_KW = Decimal('50.0') # 50kW DC Fast Charger
+
+        CHARGER_SPECS = {
+            f"charger-{str(i).zfill(3)}": {
+                "power_kw": Decimal('150.0') if i > 5 else Decimal('50.0'),
+                "voltage": 800.0 if i > 5 else 400.0
+            } for i in range(1, 11)
+        }
+
+        POSSIBLE_FAULTS = [
+            {"code": "E_TEMP_HIGH", "sev": "warning", "msg": "Thermal limit approached"},
+            {"code": "E_COMMS_LOSS", "sev": "critical", "msg": "Backend connection lost"},
+            {"code": "E_OVERCURRENT", "sev": "critical", "msg": "Overcurrent detected, charging stopped"},
+            {"code": "E_GROUND_FAULT", "sev": "critical", "msg": "Ground fault detected, safety trip"},
+            {"code": "E_READER_FAIL", "sev": "warning", "msg": "RFID/Payment reader timeout"}
+        ]
 
         class DecimalEncoder(json.JSONEncoder):
             def default(self, obj):
@@ -123,6 +137,17 @@ Resources:
             event_time = get_event_timestamp(current_synth_epoch, index)
             payloads = []
             
+            hardware = CHARGER_SPECS[charger_id]
+            current_power_kw = hardware["power_kw"]
+            base_volts = hardware["voltage"]
+            target_amps = float(current_power_kw * 1000) / base_volts
+            
+            simulated_hour = datetime.fromtimestamp(current_synth_epoch, timezone.utc).hour
+            if 7 <= simulated_hour <= 19:
+                traffic_chance = 0.15  
+            else:
+                traffic_chance = 0.02  
+            
             if not state:
                 state = {
                     'charger_id': charger_id,
@@ -132,7 +157,9 @@ Resources:
                     'energy_kwh_total': Decimal('0.0'),
                     'target_energy_kwh': Decimal('0.0'),
                     'last_update_epoch': Decimal(str(current_synth_epoch)),
-                    'fault_clear_epoch': None
+                    'fault_clear_epoch': None,
+                    'active_fault': None,
+                    'active_connector': 1 
                 }
 
             last_update = float(state['last_update_epoch'])
@@ -140,31 +167,35 @@ Resources:
             delta_synthetic_minutes = delta_synthetic_seconds / 60.0
             
             status = state['status']
+            active_conn = int(state.get('active_connector', 1))
             
             # ---------------------------------------------------------
             # STATE: AVAILABLE
             # ---------------------------------------------------------
             if status == 'AVAILABLE':
-                if random.random() < 0.10: # 10% chance to start session
+                if random.random() < traffic_chance: 
                     state['status'] = 'CHARGING'
                     state['session_id'] = f"sess-{datetime.fromtimestamp(current_synth_epoch, timezone.utc).strftime('%Y%m%d')}-{random.randint(1000,9999)}"
                     state['vehicle_id'] = f"veh-{random.randint(100, 999)}"
                     state['energy_kwh_total'] = Decimal('0.0')
+                    
+                    active_conn = random.choice([1, 2])
+                    state['active_connector'] = active_conn
                     
                     random_target = round(random.uniform(5.0, 50.0), 1)
                     state['target_energy_kwh'] = Decimal(str(random_target))
                     
                     payloads.append({
                         "event_type": "session",
-                        "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "starting", "power_kw": 0.0, "energy_kwh_total": 0.0}
+                        "payload": {"connector_id": active_conn, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "starting", "power_kw": 0.0, "energy_kwh_total": 0.0}
                     })
                 else:
                     payloads.append({
                         "event_type": "telemetry",
                         "payload": {
-                            "connector_id": 1, "status": "available", 
+                            "connector_id": active_conn, "status": "available", 
                             "temperature_c": round(random.uniform(20.0, 23.0), 1), 
-                            "voltage_v": round(random.uniform(398.0, 402.0), 1), 
+                            "voltage_v": round(random.uniform(base_volts - 2, base_volts + 2), 1), 
                             "current_a": 0.0
                         }
                     })
@@ -173,42 +204,49 @@ Resources:
             # STATE: CHARGING
             # ---------------------------------------------------------
             elif status == 'CHARGING':
-                energy_added = (POWER_KW / Decimal('60.0')) * Decimal(str(delta_synthetic_minutes))
-                state['energy_kwh_total'] += energy_added
-                
-                if state['energy_kwh_total'] >= state['target_energy_kwh']:
-                    payloads.append({
-                        "event_type": "session",
-                        "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "completed", "power_kw": 0.0, "energy_kwh_total": float(state['energy_kwh_total'])}
-                    })
-                    state['status'] = 'AVAILABLE'
-                    state['session_id'] = None
-                    state['vehicle_id'] = None
-                    state['energy_kwh_total'] = Decimal('0.0')
-                    state['target_energy_kwh'] = Decimal('0.0')
-                
-                elif random.random() < 0.10: 
+                if random.random() < 0.10: 
+                    chosen_fault = random.choice(POSSIBLE_FAULTS)
+                    
+                    # This is the initial trigger. It stays here so we log the exact moment of failure.
                     payloads.append({
                         "event_type": "fault",
-                        "payload": {"connector_id": 1, "fault_code": "E_TEMP_HIGH", "severity": "warning", "message": "Thermal limit approached"}
+                        "payload": {"connector_id": active_conn, "fault_code": chosen_fault["code"], "severity": chosen_fault["sev"], "message": chosen_fault["msg"]}
                     })
-                    state['status'] = 'FAULTED'
-                    state['fault_clear_epoch'] = Decimal(str(current_synth_epoch + (30 * 60)))
                     
+                    state['status'] = 'FAULTED'
+                    state['active_fault'] = chosen_fault
+                    state['fault_clear_epoch'] = Decimal(str(current_synth_epoch + (30 * 60)))
+                
                 else:
-                    payloads.append({
-                        "event_type": "telemetry",
-                        "payload": {
-                            "connector_id": 1, "status": "charging", 
-                            "temperature_c": round(random.uniform(38.0, 44.0), 1), 
-                            "voltage_v": round(random.uniform(395.0, 405.0), 1), 
-                            "current_a": round(random.uniform(122.0, 126.0), 1)
-                        }
-                    })
-                    payloads.append({
-                        "event_type": "session",
-                        "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "charging", "power_kw": float(POWER_KW), "energy_kwh_total": float(state['energy_kwh_total'])}
-                    })
+                    energy_added = (current_power_kw / Decimal('60.0')) * Decimal(str(delta_synthetic_minutes))
+                    state['energy_kwh_total'] += energy_added
+                    
+                    if state['energy_kwh_total'] >= state['target_energy_kwh']:
+                        payloads.append({
+                            "event_type": "session",
+                            "payload": {"connector_id": active_conn, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "completed", "power_kw": 0.0, "energy_kwh_total": float(state['energy_kwh_total'])}
+                        })
+                        state['status'] = 'AVAILABLE'
+                        state['session_id'] = None
+                        state['vehicle_id'] = None
+                        state['energy_kwh_total'] = Decimal('0.0')
+                        state['target_energy_kwh'] = Decimal('0.0')
+                        state['active_fault'] = None
+                        
+                    else:
+                        payloads.append({
+                            "event_type": "telemetry",
+                            "payload": {
+                                "connector_id": active_conn, "status": "charging", 
+                                "temperature_c": round(random.uniform(38.0, 44.0), 1), 
+                                "voltage_v": round(random.uniform(base_volts - 5, base_volts + 5), 1), 
+                                "current_a": round(random.uniform(target_amps - 2, target_amps + 2), 1)
+                            }
+                        })
+                        payloads.append({
+                            "event_type": "session",
+                            "payload": {"connector_id": active_conn, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "charging", "power_kw": float(current_power_kw), "energy_kwh_total": float(state['energy_kwh_total'])}
+                        })
 
             # ---------------------------------------------------------
             # STATE: FAULTED
@@ -217,33 +255,28 @@ Resources:
                 if current_synth_epoch >= float(state['fault_clear_epoch']):
                     state['status'] = 'AVAILABLE'
                     state['fault_clear_epoch'] = None
+                    state['active_fault'] = None
+                    
                     if state['session_id']:
                         payloads.append({
                             "event_type": "session",
-                            "payload": {"connector_id": 1, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "completed", "power_kw": 0.0, "energy_kwh_total": float(state['energy_kwh_total'])}
+                            "payload": {"connector_id": active_conn, "session_id": state['session_id'], "vehicle_id": state['vehicle_id'], "state": "completed", "power_kw": 0.0, "energy_kwh_total": float(state['energy_kwh_total'])}
                         })
                         state['session_id'] = None
                         state['vehicle_id'] = None
                         state['energy_kwh_total'] = Decimal('0.0')
                         state['target_energy_kwh'] = Decimal('0.0')
                 else:
-                    # ---> STILL FAULTED: Output BOTH telemetry and fault events every minute <---
+                    active_fault = state.get('active_fault') or POSSIBLE_FAULTS[0]
+                    
+                    # Output ONLY telemetry while waiting for the fault to clear
                     payloads.append({
                         "event_type": "telemetry",
                         "payload": {
-                            "connector_id": 1, "status": "faulted", 
-                            "temperature_c": round(random.uniform(44.0, 46.0), 1), 
-                            "voltage_v": round(random.uniform(398.0, 402.0), 1), 
+                            "connector_id": active_conn, "status": "faulted", 
+                            "temperature_c": round(random.uniform(44.0, 46.0), 1) if active_fault['code'] == 'E_TEMP_HIGH' else round(random.uniform(22.0, 25.0), 1), 
+                            "voltage_v": round(random.uniform(base_volts - 2, base_volts + 2), 1), 
                             "current_a": 0.0
-                        }
-                    })
-                    payloads.append({
-                        "event_type": "fault",
-                        "payload": {
-                            "connector_id": 1, 
-                            "fault_code": "E_TEMP_HIGH", 
-                            "severity": "warning", 
-                            "message": "Thermal limit approached (Active Alarm)"
                         }
                     })
 
