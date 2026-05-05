@@ -4,8 +4,8 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql.functions import col, from_json, min, max, round
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
+from pyspark.sql.functions import col, min, max, round
+from pyspark.sql.types import TimestampType
 
 # 1. Parse arguments passed from the Glue Job parameters
 args = getResolvedOptions(sys.argv, [
@@ -36,6 +36,7 @@ spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 print(f"Reading raw data from: s3://{raw_bucket}/data/")
 
 # 3. Read the raw JSON data
+# Spark automatically infers the nested 'payload' object as a StructType
 raw_df = spark.read \
     .option("basePath", f"s3://{raw_bucket}/data/") \
     .json(f"s3://{raw_bucket}/data/")
@@ -44,33 +45,15 @@ raw_df = spark.read \
 # Part 1: Data Preparation & JSON Unpacking
 # -----------------------------------------------------------------------------
 
-# Define the schema for the nested payload string
-payload_schema = StructType([
-    StructField("connector_id", IntegerType(), True),
-    StructField("status", StringType(), True),
-    StructField("temperature_c", DoubleType(), True),
-    StructField("voltage_v", DoubleType(), True),
-    StructField("current_a", DoubleType(), True),
-    StructField("session_id", StringType(), True),
-    StructField("vehicle_id", StringType(), True),
-    StructField("state", StringType(), True),
-    StructField("power_kw", DoubleType(), True),
-    StructField("energy_kwh_total", DoubleType(), True),
-    StructField("fault_code", StringType(), True),
-    StructField("severity", StringType(), True),
-    StructField("message", StringType(), True)
-])
-
-# Parse the JSON string into a Struct and flatten it, also cast event_time
+# Since 'payload' is already a Struct, we can flatten it directly with 'payload.*'
 parsed_df = raw_df \
-    .withColumn("parsed_payload", from_json(col("payload"), payload_schema)) \
     .select(
         col("event_id"),
         col("event_time").cast(TimestampType()).alias("event_time"),
         col("charger_id"),
         col("event_type"),
         col("p_ingest_day"),
-        col("parsed_payload.*") # Flattens all columns defined in the schema
+        col("payload.*") # Flattens all nested attributes automatically
     )
 
 parsed_df.cache() # Cache the dataframe as we will use it multiple times
