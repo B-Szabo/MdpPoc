@@ -50,7 +50,7 @@ Resources:
         Variables:
           INGEST_QUEUE_URL: !Ref MdpPocIngestQueue
           STATE_TABLE_NAME: !Ref MdpPocChargerStateTable
-          WORKSHOP_START_EPOCH: "1778090400" 
+          WORKSHOP_START_EPOCH: "1778070600" 
           SYNTHETIC_START_EPOCH: "1735689600"
           TIME_MULTIPLIER: "10" 
       Policies:
